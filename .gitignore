@@ -1,0 +1,12 @@
+.env
+data/
+runs/
+training/*.pth
+voices/*.pt
+__pycache__/
+*.pyc
+.venv/
+
+eval/
+
+data/

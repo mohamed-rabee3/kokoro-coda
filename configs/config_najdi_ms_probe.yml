@@ -1,0 +1,180 @@
+# Stage 2, prosody only — adversarial phase disabled.
+#
+# WHY
+# ---
+# The joint/adversarial phase destroys this model. Measured, four ways, 400
+# steps each from epoch_2nd_00000 (WER 0.028), scored identically:
+#
+#   variant     band-limit  hb-distill  Gen Loss   WER
+#   stock       off         off         10.30      1.028
+#   bandonly    8 kHz       off         10.83      1.028
+#   hbonly      off         0.5         10.64      1.028
+#   both        8 kHz       0.5         11.52      1.028
+#
+# Unanimous. The two local patches change HOW it degrades (spectral centroid
+# 276 / 351 / 269 / 818 Hz, so both are demonstrably active) but not WHETHER.
+# Gen Loss sits at 10-11 against the reference recipe's 2-4 from step 10
+# onward: the discriminators win immediately and never stop winning.
+#
+# Every training loss looks healthy while this happens — mel 1.20 -> 0.58, dur
+# 3.26 -> 0.91, F0 23.1 -> 5.9, no NaN — because reconstruction is scored
+# against style vectors from the LIVE encoders, so decoder and encoders
+# co-drift and keep agreeing with each other. Only the real inference path
+# shows it. Hence najdi/wer_gate.py.
+#
+# WHAT THIS COSTS
+# ---------------
+# SLM adversarial refinement is a real StyleTTS2 quality lever and we are
+# giving it up for now. The trade is deliberate:
+#
+#   - Najdi prosody does NOT depend on it. optimizer.step() for predictor,
+#     predictor_encoder, bert and bert_encoder fires unconditionally
+#     (train_second.py:697-700); only style_encoder and decoder are gated on
+#     joint_epoch. Duration, F0 and energy — where the dialect lives — train
+#     fully in this configuration.
+#   - The decoder gets rebuilt anyway in plan §8 on bandwidth-extended
+#     full-band audio, where the 16 kHz-upsampled band gap that hands the
+#     discriminators a free win does not exist.
+#
+# Adversarial remains recoverable later: najdi/ab_probe.sh + the
+# NAJDI_PROBE_STEPS hook make a 400-step test cost ~21 min, so lambda_slm=0 or
+# a much lower ft_lr can be probed cheaply before committing GPU days.
+#
+# THE ONE LINE THAT MATTERS
+#   joint_epoch: 999  -> never reached, so start_ds stays False, the
+#                        discriminators never update, and the reconstruction
+#                        target never switches to the band-limited recording
+#                        (train_second.py:616).
+#
+# Restarting from epoch_2nd_00000, the last checkpoint measured intact
+# (WER 0.028, Najdi durations already present), NOT from first_stage.pth.
+
+log_dir: /home/ai2/kokoro-coda/runs/probe_ms
+# save_freq 2 (~1.9 GB each, 43 GB free) is safe now that the WER gate writes
+# epoch_2nd_best.pth on every improvement, independently of save_freq. Losing
+# the healthy epoch-2 checkpoint last run was a save_freq problem only because
+# saving was driven by mel loss, which was the number that lied.
+save_freq: 2
+log_interval: 10
+device: cuda
+batch_size: 6
+max_len: 200
+epochs: 10
+pretrained_model: /home/ai2/kokoro-coda/runs/stage2/epoch_2nd_00000.pth
+# false -> restore optimizer state too. Weight loading is identical either way
+# (load_only_params only gates optimizer/start_epoch), but zeroed Adam moments
+# give the first updates a large effective step regardless of gradient scale,
+# which kicks an already-trained model: measured Dur Loss 9.03 at step 10 with
+# true, against 3.26 from the same checkpoint with false. epoch_2nd_00000's
+# optimizer state comes from the pre-joint phase, which is exactly the regime
+# being resumed here, so it is the right state to continue from.
+load_only_params: false
+F0_path: Utils/JDC/bst.t7
+ASR_config: Utils/ASR/config.yml
+ASR_path: Utils/ASR/epoch_00080.pth
+PLBERT_dir: Utils/PLBERT/
+data_params:
+  train_data: /home/ai2/kokoro-coda/data/train_list.txt
+  val_data: /home/ai2/kokoro-coda/data/val_list.txt
+  root_path: /home/ai2/kokoro-coda/data/audio
+  OOD_data: /home/ai2/kokoro-coda/data/OOD_texts.txt
+  min_length: 50
+  num_workers: 12
+preprocess_params:
+  sr: 24000
+  spect_params:
+    n_fft: 2048
+    win_length: 1200
+    hop_length: 300
+model_params:
+  dim_in: 64
+  hidden_dim: 512
+  max_conv_dim: 512
+  n_layer: 3
+  n_mels: 80
+  n_token: 178
+  max_dur: 50
+  style_dim: 128
+  dropout: 0.2
+  text_encoder_kernel_size: 5
+  multispeaker: false
+  decoder:
+    type: istftnet
+    resblock_kernel_sizes:
+    - 3
+    - 7
+    - 11
+    upsample_rates:
+    - 10
+    - 6
+    upsample_initial_channel: 512
+    resblock_dilation_sizes:
+    - - 1
+      - 3
+      - 5
+    - - 1
+      - 3
+      - 5
+    - - 1
+      - 3
+      - 5
+    upsample_kernel_sizes:
+    - 20
+    - 12
+    gen_istft_n_fft: 20
+    gen_istft_hop_size: 5
+  slm:
+    model: microsoft/wavlm-base-plus
+    sr: 16000
+    hidden: 768
+    nlayers: 13
+    initial_channel: 64
+  diffusion:
+    embedding_mask_proba: 0.1
+    transformer:
+      num_layers: 3
+      num_heads: 8
+      head_features: 64
+      multiplier: 2
+    dist:
+      sigma_data: 0.2
+      estimate_sigma_data: true
+      mean: -3.0
+      std: 1.0
+  plbert:
+    hidden_size: 768
+    num_attention_heads: 12
+    intermediate_size: 2048
+    max_position_embeddings: 512
+    num_hidden_layers: 12
+    dropout: 0.1
+loss_params:
+  lambda_mel: 5.0
+  lambda_gen: 1.0
+  lambda_slm: 1.0
+  lambda_mono: 1.0
+  lambda_s2s: 1.0
+  lambda_F0: 1.0
+  lambda_norm: 1.0
+  lambda_dur: 1.0
+  lambda_ce: 20.0
+  lambda_sty: 0.0
+  lambda_diff: 0.0
+  diff_epoch: 999
+  TMA_epoch: 0
+  joint_epoch: 999
+optimizer_params:
+  lr: 0.0001
+  bert_lr: 1.0e-05
+  ft_lr: 5.0e-05
+slmadv_params:
+  min_len: 100
+  max_len: 500
+  batch_percentage: 0.5
+  iter: 10
+  thresh: 5
+  scale: 0.01
+  sig: 1.5
+epochs_2nd: 10
+second_stage_load_pretrained: true
+first_stage_path: first_stage.pth

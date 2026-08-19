@@ -1,0 +1,142 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Nabra-82M -> Saudi Najdi, Stage 1 (acoustic)
+#
+# Derived from kikiri-tts config_german_ft.yml, which is itself StyleTTS2's
+# config_ft.yml adapted to Kokoro. Differences that matter here are flagged
+# inline. Paths are absolute on purpose: training runs from inside StyleTTS2/,
+# and relative paths there have burned this recipe before.
+#
+# NOTE: train_first.py reads batch_size / epochs_1st / save_freq /
+# pretrained_model / load_only_params from the TOP LEVEL of this file. A nested
+# `training:` block is silently ignored and you get the defaults instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+log_dir: "/home/ai2/kokoro-coda/runs/stage1"
+save_freq: 2
+log_interval: 10
+device: "cuda"
+
+# Memory scales as batch x crop length. max_len is HALVED internally
+# (mel_len = min(.., max_len//2)) and the crop becomes mel_len*2*300 waveform
+# samples, so max_len: 400 means 5 s crops at 24 kHz. batch 8 x 5 s OOMs the
+# MPD/MSD feature-matching loss at 46 GB. kikiri's working config omits max_len
+# entirely, taking StyleTTS2's default of 200 -> 2.5 s crops, which is also what
+# StyleTTS2 uses for its own first stage. Stage 1 is acoustic and local, so the
+# shorter crop costs nothing and buys a bigger batch.
+batch_size: 12
+max_len: 200                  # -> 2.5 s waveform crops
+epochs_1st: 10
+epochs: 10
+
+pretrained_model: "/home/ai2/kokoro-coda/training/nabra_base.pth"
+load_only_params: true        # non-strict load: diffusion/SLM keys are absent
+                              # from Kokoro by design, that is not an error
+
+F0_path: "Utils/JDC/bst.t7"
+ASR_config: "Utils/ASR/config.yml"
+ASR_path: "Utils/ASR/epoch_00080.pth"   # English-trained aligner; see plan §6
+PLBERT_dir: "Utils/PLBERT/"
+
+data_params:
+  train_data: "/home/ai2/kokoro-coda/data/train_list.txt"
+  val_data: "/home/ai2/kokoro-coda/data/val_list.txt"
+  root_path: "/home/ai2/kokoro-coda/data/audio"
+  OOD_data: "/home/ai2/kokoro-coda/data/OOD_texts.txt"
+  min_length: 50
+  num_workers: 12
+
+preprocess_params:
+  sr: 24000
+  spect_params:
+    n_fft: 2048
+    win_length: 1200
+    hop_length: 300
+
+model_params:
+  # Must match Kokoro-82M exactly or the pretrained weights will not load.
+  dim_in: 64
+  hidden_dim: 512
+  max_conv_dim: 512
+  n_layer: 3
+  n_mels: 80
+  n_token: 178                # 176 Kokoro symbols + Nabra's ʕ (7) and ħ (8)
+  max_dur: 50
+  style_dim: 128
+  dropout: 0.2
+  text_encoder_kernel_size: 5
+
+  # Referenced once in models.py, only to pick the diffusion transformer type.
+  # Diffusion is disabled below and Kokoro has none, so this flag is inert.
+  multispeaker: true
+
+  decoder:
+    type: "istftnet"          # Kokoro is ISTFTNet, NOT hifigan
+    resblock_kernel_sizes: [3, 7, 11]
+    upsample_rates: [10, 6]
+    upsample_initial_channel: 512
+    resblock_dilation_sizes: [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+    upsample_kernel_sizes: [20, 12]
+    gen_istft_n_fft: 20
+    gen_istft_hop_size: 5
+
+  slm:
+    model: "microsoft/wavlm-base-plus"
+    sr: 16000                 # resamples internally, so it is band-safe already
+    hidden: 768
+    nlayers: 13
+    initial_channel: 64
+
+  diffusion:
+    embedding_mask_proba: 0.1
+    transformer:
+      num_layers: 3
+      num_heads: 8
+      head_features: 64
+      multiplier: 2
+    dist:
+      sigma_data: 0.2
+      estimate_sigma_data: true
+      mean: -3.0
+      std: 1.0
+
+  plbert:
+    hidden_size: 768
+    num_attention_heads: 12
+    intermediate_size: 2048
+    max_position_embeddings: 512
+    num_hidden_layers: 12
+    dropout: 0.1
+
+loss_params:
+  lambda_mel: 5.0
+  lambda_gen: 1.0
+  lambda_slm: 1.0
+  lambda_mono: 1.0
+  lambda_s2s: 1.0
+  lambda_F0: 1.0
+  lambda_norm: 1.0
+  lambda_dur: 1.0
+  lambda_ce: 20.0
+
+  lambda_sty: 0.0             # style diffusion disabled
+  lambda_diff: 0.0            # Kokoro has no diffusion network
+  diff_epoch: 999             # never start it
+  TMA_epoch: 0                # fine-tuning, so align from the first epoch
+  joint_epoch: 3
+
+optimizer_params:
+  lr: 0.0001
+  bert_lr: 0.00001            # PLBERT carries pretrained knowledge, move it slowly
+  ft_lr: 0.00005              # acoustic modules at half LR: the dialect lives in
+                              # phonemes/durations/F0, not in the vocoder, and the
+                              # decoder is the part we least want drifting while
+                              # the high band is unsupervised (plan §5)
+
+slmadv_params:
+  min_len: 100
+  max_len: 500
+  batch_percentage: 0.5
+  iter: 10
+  thresh: 5
+  scale: 0.01
+  sig: 1.5

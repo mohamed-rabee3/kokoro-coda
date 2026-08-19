@@ -1,0 +1,136 @@
+# Stage 2 (prosody + adversarial). Generated from config_najdi_stage1.yml.
+#
+# THE number to watch: Stage 2 mel loss must START near ~0.43. Above 2.0 means
+# the pretrained weights did not load - check DataParallel wrap order (load
+# checkpoint THEN wrap) and that ignore_modules is not excluding pretrained
+# prosody modules. Do not train through it.
+#
+# second_stage_load_pretrained: false means "load from first_stage.pth", which
+# train_second.py resolves RELATIVE TO log_dir - hence runs/stage2/first_stage.pth.
+#
+# train_second.py adds start_epoch (9, from the Stage 1 checkpoint) to
+# epochs/joint_epoch/diff_epoch, so joint_epoch: 3 means SLM adversarial and
+# decoder training begin 3 epochs into this stage, and epochs_2nd: 10 runs
+# epochs 9..19.
+#
+# This is the stage that actually learns Najdi prosody: Stage 1 never touches
+# `predictor` or `bert` (verified - bit-identical weights after 10 epochs).
+
+log_dir: /home/ai2/kokoro-coda/runs/stage2
+save_freq: 2
+log_interval: 10
+device: cuda
+batch_size: 6
+max_len: 200
+epochs: 10
+pretrained_model: /home/ai2/kokoro-coda/training/nabra_base.pth
+load_only_params: true
+F0_path: Utils/JDC/bst.t7
+ASR_config: Utils/ASR/config.yml
+ASR_path: Utils/ASR/epoch_00080.pth
+PLBERT_dir: Utils/PLBERT/
+data_params:
+  train_data: /home/ai2/kokoro-coda/data/train_list.txt
+  val_data: /home/ai2/kokoro-coda/data/val_list.txt
+  root_path: /home/ai2/kokoro-coda/data/audio
+  OOD_data: /home/ai2/kokoro-coda/data/OOD_texts.txt
+  min_length: 50
+  num_workers: 12
+preprocess_params:
+  sr: 24000
+  spect_params:
+    n_fft: 2048
+    win_length: 1200
+    hop_length: 300
+model_params:
+  dim_in: 64
+  hidden_dim: 512
+  max_conv_dim: 512
+  n_layer: 3
+  n_mels: 80
+  n_token: 178
+  max_dur: 50
+  style_dim: 128
+  dropout: 0.2
+  text_encoder_kernel_size: 5
+  multispeaker: true
+  decoder:
+    type: istftnet
+    resblock_kernel_sizes:
+    - 3
+    - 7
+    - 11
+    upsample_rates:
+    - 10
+    - 6
+    upsample_initial_channel: 512
+    resblock_dilation_sizes:
+    - - 1
+      - 3
+      - 5
+    - - 1
+      - 3
+      - 5
+    - - 1
+      - 3
+      - 5
+    upsample_kernel_sizes:
+    - 20
+    - 12
+    gen_istft_n_fft: 20
+    gen_istft_hop_size: 5
+  slm:
+    model: microsoft/wavlm-base-plus
+    sr: 16000
+    hidden: 768
+    nlayers: 13
+    initial_channel: 64
+  diffusion:
+    embedding_mask_proba: 0.1
+    transformer:
+      num_layers: 3
+      num_heads: 8
+      head_features: 64
+      multiplier: 2
+    dist:
+      sigma_data: 0.2
+      estimate_sigma_data: true
+      mean: -3.0
+      std: 1.0
+  plbert:
+    hidden_size: 768
+    num_attention_heads: 12
+    intermediate_size: 2048
+    max_position_embeddings: 512
+    num_hidden_layers: 12
+    dropout: 0.1
+loss_params:
+  lambda_mel: 5.0
+  lambda_gen: 1.0
+  lambda_slm: 1.0
+  lambda_mono: 1.0
+  lambda_s2s: 1.0
+  lambda_F0: 1.0
+  lambda_norm: 1.0
+  lambda_dur: 1.0
+  lambda_ce: 20.0
+  lambda_sty: 0.0
+  lambda_diff: 0.0
+  diff_epoch: 999
+  TMA_epoch: 0
+  joint_epoch: 3
+optimizer_params:
+  lr: 0.0001
+  bert_lr: 1.0e-05
+  ft_lr: 5.0e-05
+slmadv_params:
+  min_len: 100
+  max_len: 500
+  batch_percentage: 0.5
+  iter: 10
+  thresh: 5
+  scale: 0.01
+  sig: 1.5
+epochs_2nd: 10
+second_stage_load_pretrained: false
+first_stage_path: first_stage.pth

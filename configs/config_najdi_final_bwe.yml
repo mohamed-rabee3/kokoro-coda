@@ -1,0 +1,171 @@
+# FINAL PHASE (plan §8) — full-band fine-tune on the bandwidth-extended core.
+#
+# This is the stage that restores 24 kHz brightness. Everything before it was
+# trained on 16 kHz recordings upsampled to 24 kHz, i.e. genuinely silent above
+# 8 kHz, so the decoder never had a reason to synthesize that band.
+#
+# WHY ADVERSARIAL IS ON HERE, AND WHY THAT IS NOT A REGRESSION
+# -----------------------------------------------------------
+# optimizer.step("decoder") lives inside the SAME `epoch >= joint_epoch` block
+# as the SLM adversarial loss (train_second.py). Training the decoder — the
+# entire point of this phase — therefore REQUIRES joint_epoch: 0. It is not
+# optional and cannot be separated without patching upstream.
+#
+# An earlier four-way probe concluded the adversarial phase "destroys the
+# model". That conclusion was WRONG: every variant in it resumed from an
+# untreated predictor_encoder, whose output norm exploded 1.66 -> 45 within 100
+# steps regardless of what was being toggled. NAJDI_PE_FT=1 fixes that, and
+# Stage 2 then ran 10 clean epochs at WER 0.028. Two further conditions now
+# also differ in our favour:
+#   - the training audio is genuinely full-band, so MPD/MSD can no longer win
+#     for free by detecting the empty 8-12 kHz band
+#   - the band-safe patches are OFF (NAJDI_BAND_LIMIT_HZ=0, NAJDI_HB_LAMBDA=0)
+#     because there is no longer a band to protect
+#
+# Run with:  NAJDI_PE_FT=1 NAJDI_BAND_LIMIT_HZ=0 NAJDI_HB_LAMBDA=0
+#
+# DATA: 25.1 h voice core, AudioSR "speech" 16k->48k, downsampled to 24 kHz and
+# trimmed to the source frame count (AudioSR pads to 10.24 s latent windows;
+# untrimmed, every clip would be misaligned against its transcript).
+# Verified on 300 random clips: 300/300 length-aligned, 0 failures, and
+# db_8_10k -73.3 -> -14.0 against genuine full-band -14.1, pkmean 3.34 vs 3.40
+# (no diffusion buzz). See najdi/bwe_check.py.
+#
+# LR is dropped ~5x (1e-4 -> 2e-5) and this runs 3 epochs, not 10: the goal is
+# to restore the high band, NOT to relearn Najdi. The WER gate stays armed.
+
+log_dir: /home/ai2/kokoro-coda/runs/final_bwe
+# save_freq 2 (~1.9 GB each, 43 GB free) is safe now that the WER gate writes
+# epoch_2nd_best.pth on every improvement, independently of save_freq. Losing
+# the healthy epoch-2 checkpoint last run was a save_freq problem only because
+# saving was driven by mel loss, which was the number that lied.
+save_freq: 1
+log_interval: 10
+device: cuda
+batch_size: 6
+max_len: 200
+epochs: 3
+pretrained_model: /home/ai2/kokoro-coda/runs/stage2_noadv/epoch_2nd_00008.pth
+# true, deliberately, and it fixes TWO silent failures here:
+#
+#  1. start_epoch. load_checkpoint restores epoch=8 from epoch_2nd_00008, and
+#     the loop is `for epoch in range(start_epoch, epochs)` (train_second.py).
+#     With epochs: 3 that is range(8, 3) — EMPTY. The first attempt loaded every
+#     module, printed the optimizer, and exited 0 having trained nothing.
+#  2. learning rate. optimizer.load_state_dict() restores param_groups from the
+#     checkpoint, including lr/initial_lr/max_lr. The 5x LR reduction below was
+#     silently overwritten by the old 1e-4 (verified in the probe's optimizer
+#     dump: decoder max_lr 0.0001, not 2e-5).
+#
+# The cost is a fresh Adam state, which earlier cost a startup kick (Dur 3.26 ->
+# 9.03 at lr 1e-4). At 2e-5 that kick is 5x smaller, and the WER gate is armed.
+load_only_params: true
+F0_path: Utils/JDC/bst.t7
+ASR_config: Utils/ASR/config.yml
+ASR_path: Utils/ASR/epoch_00080.pth
+PLBERT_dir: Utils/PLBERT/
+data_params:
+  train_data: /home/ai2/kokoro-coda/data/bwe_train_list.txt
+  val_data: /home/ai2/kokoro-coda/data/bwe_val_list.txt
+  root_path: /home/ai2/kokoro-coda/data/audio_bwe
+  OOD_data: /home/ai2/kokoro-coda/data/OOD_texts.txt
+  min_length: 50
+  num_workers: 12
+preprocess_params:
+  sr: 24000
+  spect_params:
+    n_fft: 2048
+    win_length: 1200
+    hop_length: 300
+model_params:
+  dim_in: 64
+  hidden_dim: 512
+  max_conv_dim: 512
+  n_layer: 3
+  n_mels: 80
+  n_token: 178
+  max_dur: 50
+  style_dim: 128
+  dropout: 0.2
+  text_encoder_kernel_size: 5
+  multispeaker: true
+  decoder:
+    type: istftnet
+    resblock_kernel_sizes:
+    - 3
+    - 7
+    - 11
+    upsample_rates:
+    - 10
+    - 6
+    upsample_initial_channel: 512
+    resblock_dilation_sizes:
+    - - 1
+      - 3
+      - 5
+    - - 1
+      - 3
+      - 5
+    - - 1
+      - 3
+      - 5
+    upsample_kernel_sizes:
+    - 20
+    - 12
+    gen_istft_n_fft: 20
+    gen_istft_hop_size: 5
+  slm:
+    model: microsoft/wavlm-base-plus
+    sr: 16000
+    hidden: 768
+    nlayers: 13
+    initial_channel: 64
+  diffusion:
+    embedding_mask_proba: 0.1
+    transformer:
+      num_layers: 3
+      num_heads: 8
+      head_features: 64
+      multiplier: 2
+    dist:
+      sigma_data: 0.2
+      estimate_sigma_data: true
+      mean: -3.0
+      std: 1.0
+  plbert:
+    hidden_size: 768
+    num_attention_heads: 12
+    intermediate_size: 2048
+    max_position_embeddings: 512
+    num_hidden_layers: 12
+    dropout: 0.1
+loss_params:
+  lambda_mel: 5.0
+  lambda_gen: 1.0
+  lambda_slm: 1.0
+  lambda_mono: 1.0
+  lambda_s2s: 1.0
+  lambda_F0: 1.0
+  lambda_norm: 1.0
+  lambda_dur: 1.0
+  lambda_ce: 20.0
+  lambda_sty: 0.0
+  lambda_diff: 0.0
+  diff_epoch: 999
+  TMA_epoch: 0
+  joint_epoch: 0
+optimizer_params:
+  lr: 2.0e-05
+  bert_lr: 1.0e-05
+  ft_lr: 1.0e-05
+slmadv_params:
+  min_len: 100
+  max_len: 500
+  batch_percentage: 0.5
+  iter: 10
+  thresh: 5
+  scale: 0.01
+  sig: 1.5
+epochs_2nd: 3
+second_stage_load_pretrained: true
+first_stage_path: first_stage.pth
